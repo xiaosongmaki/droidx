@@ -11,9 +11,32 @@ import { join } from "node:path";
 const SERVICE_NAME = "droidx";
 const CONFIG_DIR = join(homedir(), ".config", "droidx");
 const CONFIG_PATH = join(CONFIG_DIR, "profiles.json");
+const FACTORY_API_BASE = "https://api.factory.ai";
+const FETCH_TIMEOUT_MS = 10_000;
 
 type Config = {
   profiles: string[];
+};
+
+/** A single rate-limit window returned by the billing API. */
+type WindowInfo = {
+  window: string;       // e.g. "5h", "weekly", "monthly"
+  limit: number;
+  remaining: number;
+  reset_at: string;     // ISO-8601
+};
+
+/** Parsed limits for one profile. */
+type ProfileLimits = {
+  name: string;
+  apiKey: string;
+  windows: WindowInfo[];
+  error?: string;       // set when the API call fails
+};
+
+/** Profile with a computed urgency score. */
+type ScoredProfile = ProfileLimits & {
+  urgency: number;
 };
 
 function fail(message: string): never {
@@ -172,6 +195,11 @@ async function runDroid(name: string, commandArgs: string[]): Promise<void> {
     fail(`Profile "${name}" does not exist or has no saved API key.`);
   }
 
+  spawnDroid(apiKey, commandArgs);
+}
+
+/** Spawn the droid CLI with the given API key injected. */
+function spawnDroid(apiKey: string, commandArgs: string[]): void {
   const [command = "droid", ...args] =
     commandArgs.length > 0 ? commandArgs : ["droid"];
 
@@ -195,6 +223,344 @@ async function runDroid(name: string, commandArgs: string[]): Promise<void> {
       process.exit(code ?? 1);
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Billing / limits helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * New API response shape (token-rate-limits billing).
+ *
+ * ```json
+ * {
+ *   "usesTokenRateLimitsBilling": true,
+ *   "limits": {
+ *     "standard": {
+ *       "fiveHour":  { "usedPercent": 49, "windowEnd": "...", "secondsRemaining": 12345 },
+ *       "weekly":    { "usedPercent": 10, "windowEnd": "...", "secondsRemaining": 54321 },
+ *       "monthly":   { "usedPercent": 5,  "windowEnd": "...", "secondsRemaining": 99999 }
+ *     }
+ *   }
+ * }
+ * ```
+ */
+type TokenWindowInfo = {
+  usedPercent: number;
+  windowEnd: string | null;
+  secondsRemaining: number | null;
+};
+
+type TokenRateLimitsResponse = {
+  usesTokenRateLimitsBilling: boolean;
+  limits: {
+    standard: Record<string, TokenWindowInfo>;
+  };
+};
+
+/** Map from the new API key names to the internal window names. */
+const TOKEN_WINDOW_KEY_MAP: Record<string, string> = {
+  fiveHour: "5h",
+  weekly: "weekly",
+  monthly: "monthly",
+};
+
+/**
+ * Check whether `body` matches the new token-rate-limits billing shape and,
+ * if so, convert it into the existing WindowInfo[] format.
+ *
+ * We normalise to limit=100 / remaining=(100−usedPercent) so that percentage
+ * display and urgency scoring keep working without changes.
+ */
+function tryParseTokenRateLimits(body: unknown): WindowInfo[] | null {
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("usesTokenRateLimitsBilling" in body)
+  ) {
+    return null;
+  }
+
+  const typed = body as TokenRateLimitsResponse;
+  const standard = typed.limits?.standard;
+  if (typeof standard !== "object" || standard === null) return null;
+
+  const windows: WindowInfo[] = [];
+  const now = Date.now();
+
+  for (const [apiKey, windowName] of Object.entries(TOKEN_WINDOW_KEY_MAP)) {
+    const info = standard[apiKey] as TokenWindowInfo | undefined;
+    if (!info || typeof info.usedPercent !== "number") continue;
+
+    // Compute reset_at from windowEnd or secondsRemaining, falling back to now.
+    let resetAt: string;
+    if (info.windowEnd) {
+      resetAt = info.windowEnd;
+    } else if (
+      typeof info.secondsRemaining === "number" &&
+      info.secondsRemaining > 0
+    ) {
+      resetAt = new Date(now + info.secondsRemaining * 1000).toISOString();
+    } else {
+      // Window hasn't started yet or no data — treat as far future so it
+      // doesn't inflate urgency.
+      resetAt = new Date(now + windowSizeMs(windowName)).toISOString();
+    }
+
+    windows.push({
+      window: windowName,
+      limit: 100,
+      remaining: Math.max(0, 100 - info.usedPercent),
+      reset_at: resetAt,
+    });
+  }
+
+  return windows.length > 0 ? windows : null;
+}
+
+/** Fetch rate-limit windows for a single API key. */
+async function fetchLimits(
+  name: string,
+  apiKey: string,
+): Promise<ProfileLimits> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    const res = await fetch(`${FACTORY_API_BASE}/api/billing/limits`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const status = res.status;
+      if (status === 401) return { name, apiKey, windows: [], error: "invalid API key" };
+      if (status === 429) return { name, apiKey, windows: [], error: "rate limited" };
+      return { name, apiKey, windows: [], error: `HTTP ${status}` };
+    }
+
+    const body: unknown = await res.json();
+
+    // ---------- Parse response ----------
+    let windows: WindowInfo[];
+
+    // 1) New token-rate-limits billing shape.
+    const tokenWindows = tryParseTokenRateLimits(body);
+    if (tokenWindows) {
+      windows = tokenWindows;
+    }
+    // 2) Legacy: WindowInfo[] at top level.
+    else if (Array.isArray(body)) {
+      windows = body as WindowInfo[];
+    }
+    // 3) Legacy: { data: WindowInfo[] }.
+    else if (
+      typeof body === "object" &&
+      body !== null &&
+      "data" in body &&
+      Array.isArray((body as Record<string, unknown>).data)
+    ) {
+      windows = (body as Record<string, unknown>).data as WindowInfo[];
+    } else {
+      return {
+        name,
+        apiKey,
+        windows: [],
+        error: `unexpected response shape: ${JSON.stringify(body).slice(0, 120)}`,
+      };
+    }
+
+    return { name, apiKey, windows };
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : "unknown error";
+    return { name, apiKey, windows: [], error: message };
+  }
+}
+
+/** Map a window name to its total size in milliseconds. */
+function windowSizeMs(windowName: string): number {
+  const lower = windowName.toLowerCase();
+  if (lower === "5h" || lower === "5_hour" || lower === "5-hour")
+    return 5 * 60 * 60 * 1000;
+  if (lower === "weekly" || lower === "7d")
+    return 7 * 24 * 60 * 60 * 1000;
+  if (lower === "monthly" || lower === "30d")
+    return 30 * 24 * 60 * 60 * 1000;
+  // Fallback: treat unknown windows as 24 h so they still get a score.
+  return 24 * 60 * 60 * 1000;
+}
+
+/**
+ * Compute an urgency score for a profile.
+ *
+ * Higher urgency → more quota about to be wasted → should be used first.
+ * Returns -1 when all windows are exhausted.
+ */
+function scoreProfile(limits: ProfileLimits): number {
+  if (limits.error || limits.windows.length === 0) return -1;
+
+  const allExhausted = limits.windows.every((w) => w.remaining <= 0);
+  if (allExhausted) return -1;
+
+  const now = Date.now();
+  let maxWasteRisk = 0;
+
+  for (const w of limits.windows) {
+    if (w.limit <= 0) continue;
+
+    const usageRatio = w.remaining / w.limit;                // 0–1
+    const resetMs = new Date(w.reset_at).getTime();
+    const totalWindowMs = windowSizeMs(w.window);
+    const timeLeftRatio = Math.max(
+      0,
+      Math.min(1, (resetMs - now) / totalWindowMs),
+    );                                                       // 0–1
+    const wasteRisk = usageRatio * (1 - timeLeftRatio);
+
+    if (wasteRisk > maxWasteRisk) maxWasteRisk = wasteRisk;
+  }
+
+  return maxWasteRisk;
+}
+
+/** Fetch limits for every saved profile in parallel. */
+async function getAllProfileLimits(): Promise<ProfileLimits[]> {
+  const config = await loadConfig();
+  if (config.profiles.length === 0) {
+    fail("No profiles yet. Add one with: droidx add <name>");
+  }
+
+  const tasks = config.profiles.map(async (name) => {
+    const apiKey = await keytar.getPassword(SERVICE_NAME, name);
+    if (apiKey === null) {
+      return { name, apiKey: "", windows: [], error: "no API key in Keychain" } as ProfileLimits;
+    }
+    return fetchLimits(name, apiKey);
+  });
+
+  return Promise.all(tasks);
+}
+
+// ---------------------------------------------------------------------------
+// status command
+// ---------------------------------------------------------------------------
+
+function pctStr(remaining: number, limit: number): string {
+  if (limit <= 0) return "  -  ";
+  const pct = Math.round((remaining / limit) * 100);
+  return `${remaining}/${limit} (${pct}%)`;
+}
+
+async function showStatus(): Promise<void> {
+  const all = await getAllProfileLimits();
+
+  // Score and sort.
+  const scored: ScoredProfile[] = all
+    .map((p) => ({ ...p, urgency: scoreProfile(p) }))
+    .sort((a, b) => b.urgency - a.urgency);
+
+  const bestName =
+    scored.length > 0 && scored[0].urgency > 0 ? scored[0].name : null;
+
+  // Find window columns present in data.
+  const windowOrder = ["5h", "weekly", "monthly"];
+  const findWindow = (ws: WindowInfo[], key: string): WindowInfo | undefined =>
+    ws.find((w) => w.window.toLowerCase() === key);
+
+  // Print.
+  console.log();
+  const hdr = [
+    "Profile".padEnd(16),
+    "5h Remaining".padEnd(16),
+    "Weekly Remaining".padEnd(18),
+    "Monthly Remaining".padEnd(19),
+    "Urgency",
+  ].join("  ");
+  console.log(hdr);
+  console.log("─".repeat(hdr.length));
+
+  for (const p of scored) {
+    if (p.error) {
+      console.log(
+        `${p.name.padEnd(16)}  ⚠  ${p.error}`,
+      );
+      continue;
+    }
+
+    const cols = windowOrder.map((key) => {
+      const w = findWindow(p.windows, key);
+      if (!w) return "-".padEnd(key === "monthly" ? 19 : key === "weekly" ? 18 : 16);
+      return pctStr(w.remaining, w.limit).padEnd(
+        key === "monthly" ? 19 : key === "weekly" ? 18 : 16,
+      );
+    });
+
+    const marker = p.name === bestName ? " ★" : "";
+    const urgStr = p.urgency >= 0 ? p.urgency.toFixed(2) : "  -";
+    console.log(
+      `${p.name.padEnd(16)}  ${cols.join("  ")}  ${urgStr}${marker}`,
+    );
+  }
+
+  console.log();
+  if (bestName) {
+    console.log(`★ Recommended: ${bestName}`);
+  } else {
+    console.log("No available profiles.");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// auto command
+// ---------------------------------------------------------------------------
+
+async function autoRun(
+  commandArgs: string[],
+  options: { dryRun?: boolean },
+): Promise<void> {
+  const all = await getAllProfileLimits();
+
+  // Print warnings for failed profiles.
+  for (const p of all) {
+    if (p.error) {
+      console.error(`⚠  ${p.name}: ${p.error}`);
+    }
+  }
+
+  const scored: ScoredProfile[] = all
+    .filter((p) => !p.error && p.windows.length > 0)
+    .map((p) => ({ ...p, urgency: scoreProfile(p) }))
+    .filter((p) => p.urgency > 0)
+    .sort((a, b) => {
+      if (b.urgency !== a.urgency) return b.urgency - a.urgency;
+      // Tie-break: prefer more 5h remaining (short window is most urgent).
+      const a5h = a.windows.find((w) => w.window === "5h")?.remaining ?? 0;
+      const b5h = b.windows.find((w) => w.window === "5h")?.remaining ?? 0;
+      if (b5h !== a5h) return b5h - a5h;
+      return a.name.localeCompare(b.name);
+    });
+
+  if (scored.length === 0) {
+    fail("All profiles are exhausted or unreachable.");
+  }
+
+  const best = scored[0];
+
+  // Show a one-liner summary.
+  const parts = best.windows.map(
+    (w) => `${w.window}: ${w.remaining}/${w.limit}`,
+  );
+  console.log(`Using "${best.name}" — ${parts.join(", ")}`);
+
+  if (options.dryRun) {
+    console.log("(dry run — not launching droid)");
+    return;
+  }
+
+  spawnDroid(best.apiKey, commandArgs);
 }
 
 const program = new Command();
@@ -227,6 +593,22 @@ program
   .allowExcessArguments()
   .action((name: string, commandArgs: string[] = []) =>
     runDroid(name, commandArgs),
+  );
+
+program
+  .command("status")
+  .description("Show remaining quota for all profiles")
+  .action(showStatus);
+
+program
+  .command("auto [commandArgs...]")
+  .description(
+    "Automatically pick the best profile based on remaining quota, then run droid",
+  )
+  .option("--dry-run", "Show which profile would be selected without launching droid")
+  .allowExcessArguments()
+  .action((commandArgs: string[] = [], options: { dryRun?: boolean }) =>
+    autoRun(commandArgs, options),
   );
 
 if (process.argv.length <= 2) {
