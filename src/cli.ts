@@ -14,8 +14,34 @@ const CONFIG_PATH = join(CONFIG_DIR, "profiles.json");
 const FACTORY_API_BASE = "https://api.factory.ai";
 const FETCH_TIMEOUT_MS = 10_000;
 
+// ---------------------------------------------------------------------------
+// Scoring tunables
+// ---------------------------------------------------------------------------
+
+/** If a profile's 5h remaining drops below this %, treat it as currently unusable. */
+let MIN_5H_REMAINING_PCT = 15;
+
+/**
+ * Weights for combining weekly and monthly waste risk into a single urgency
+ * score.  Weekly quota resets sooner so wasting it is more immediate;
+ * monthly is still important but slightly less urgent to burn through.
+ */
+let WEEKLY_WASTE_WEIGHT = 0.8;
+let MONTHLY_WASTE_WEIGHT = 0.2;
+
+type Settings = {
+  weeklyWeight: number;   // monthly = 1 - weeklyWeight
+  min5hPct: number;
+};
+
+const DEFAULT_SETTINGS: Settings = {
+  weeklyWeight: WEEKLY_WASTE_WEIGHT,
+  min5hPct: MIN_5H_REMAINING_PCT,
+};
+
 type Config = {
   profiles: string[];
+  settings?: Partial<Settings>;
 };
 
 /** A single rate-limit window returned by the billing API. */
@@ -65,7 +91,11 @@ async function loadConfig(): Promise<Config> {
     ) {
       throw new Error("invalid configuration");
     }
-    return { profiles: parsed.profiles };
+    const config: Config = { profiles: parsed.profiles };
+    if ("settings" in parsed && typeof parsed.settings === "object" && parsed.settings !== null) {
+      config.settings = parsed.settings as Partial<Settings>;
+    }
+    return config;
   } catch (error: unknown) {
     if (
       error instanceof Error &&
@@ -75,6 +105,19 @@ async function loadConfig(): Promise<Config> {
       return { profiles: [] };
     }
     fail(`Cannot read ${CONFIG_PATH}.`);
+  }
+}
+
+/** Apply persisted settings to the module-level scoring variables. */
+function applySettings(config: Config): void {
+  const s = config.settings;
+  if (!s) return;
+  if (typeof s.weeklyWeight === "number") {
+    WEEKLY_WASTE_WEIGHT = s.weeklyWeight;
+    MONTHLY_WASTE_WEIGHT = 1 - s.weeklyWeight;
+  }
+  if (typeof s.min5hPct === "number") {
+    MIN_5H_REMAINING_PCT = s.min5hPct;
   }
 }
 
@@ -396,8 +439,24 @@ function windowSizeMs(windowName: string): number {
 /**
  * Compute an urgency score for a profile.
  *
- * Higher urgency → more quota about to be wasted → should be used first.
- * Returns -1 when all windows are exhausted.
+ * Design rationale
+ * ────────────────
+ * • **5h window** acts as a *usability gate* — if the 5h remaining drops
+ *   below {@link MIN_5H_REMAINING_PCT} the profile is effectively throttled
+ *   right now, so we return −1 (unusable).  Wasting 5h quota is acceptable;
+ *   it resets quickly.
+ *
+ * • **Weekly / Monthly windows** are the *real cost centres*.  We compute a
+ *   per-window "waste risk" (how much quota will be lost if not consumed
+ *   before the window resets) and combine them with configurable weights
+ *   ({@link WEEKLY_WASTE_WEIGHT}, {@link MONTHLY_WASTE_WEIGHT}).
+ *
+ *   wasteRisk(w) = (remaining / limit) × (1 − timeLeftRatio)
+ *
+ *   urgency = W_weekly × weeklyWasteRisk + W_monthly × monthlyWasteRisk
+ *
+ * Higher urgency → more valuable quota about to be wasted → use first.
+ * Returns −1 when the profile cannot be used.
  */
 function scoreProfile(limits: ProfileLimits): number {
   if (limits.error || limits.windows.length === 0) return -1;
@@ -406,24 +465,58 @@ function scoreProfile(limits: ProfileLimits): number {
   if (allExhausted) return -1;
 
   const now = Date.now();
-  let maxWasteRisk = 0;
+
+  // ── 5h usability gate ──────────────────────────────────────────────────
+  // A near-zero 5h window means the profile is rate-limited *right now*,
+  // regardless of how much weekly/monthly quota remains.
+  const w5h = limits.windows.find(
+    (w) => w.window.toLowerCase() === "5h" || w.window.toLowerCase() === "5_hour",
+  );
+  if (w5h && w5h.limit > 0) {
+    const remainingPct = (w5h.remaining / w5h.limit) * 100;
+    if (remainingPct < MIN_5H_REMAINING_PCT) return -1;
+  }
+
+  // ── Weekly / Monthly waste risk ────────────────────────────────────────
+  let weeklyRisk = 0;
+  let monthlyRisk = 0;
+  let hasLongWindowQuota = false;
 
   for (const w of limits.windows) {
     if (w.limit <= 0) continue;
+    const key = w.window.toLowerCase();
+    if (key === "5h" || key === "5_hour" || key === "5-hour") continue;
 
-    const usageRatio = w.remaining / w.limit;                // 0–1
+    const usageRatio = w.remaining / w.limit;                  // 0–1
     const resetMs = new Date(w.reset_at).getTime();
     const totalWindowMs = windowSizeMs(w.window);
     const timeLeftRatio = Math.max(
       0,
       Math.min(1, (resetMs - now) / totalWindowMs),
-    );                                                       // 0–1
+    );                                                          // 0–1
     const wasteRisk = usageRatio * (1 - timeLeftRatio);
 
-    if (wasteRisk > maxWasteRisk) maxWasteRisk = wasteRisk;
+    if (key === "weekly" || key === "7d") {
+      weeklyRisk = wasteRisk;
+      if (w.remaining > 0) hasLongWindowQuota = true;
+    }
+    if (key === "monthly" || key === "30d") {
+      monthlyRisk = wasteRisk;
+      if (w.remaining > 0) hasLongWindowQuota = true;
+    }
   }
 
-  return maxWasteRisk;
+  let urgency =
+    WEEKLY_WASTE_WEIGHT * weeklyRisk + MONTHLY_WASTE_WEIGHT * monthlyRisk;
+
+  // Ensure a usable profile with remaining long-window quota always scores
+  // > 0 so that `auto` can still pick it at the very start of a fresh
+  // window (when wasteRisk ≈ 0 for everyone).
+  if (urgency === 0 && hasLongWindowQuota) {
+    urgency = 0.001;
+  }
+
+  return urgency;
 }
 
 /** Fetch limits for every saved profile in parallel. */
@@ -568,7 +661,11 @@ const program = new Command();
 program
   .name("droidx")
   .description("Run Factory Droid with a selected API-key profile.")
-  .version("0.1.0");
+  .version("0.1.0")
+  .hook("preAction", async () => {
+    const config = await loadConfig();
+    applySettings(config);
+  });
 
 program
   .command("add <name>")
@@ -610,6 +707,88 @@ program
   .action((commandArgs: string[] = [], options: { dryRun?: boolean }) =>
     autoRun(commandArgs, options),
   );
+
+// ---------------------------------------------------------------------------
+// config command
+// ---------------------------------------------------------------------------
+
+const SETTING_KEYS: Record<string, { field: keyof Settings; desc: string; validate: (v: number) => string | null }> = {
+  "weekly-weight": {
+    field: "weeklyWeight",
+    desc: "Weight for weekly waste risk (monthly = 1 − this value)",
+    validate: (v) => (v < 0 || v > 1) ? "Must be between 0 and 1." : null,
+  },
+  "min-5h": {
+    field: "min5hPct",
+    desc: "5h remaining % below which a profile is unusable",
+    validate: (v) => (v < 0 || v > 100) ? "Must be between 0 and 100." : null,
+  },
+};
+
+const configCmd = program
+  .command("config [key] [value]")
+  .description("Show or update scoring settings (persisted to disk)")
+  .addHelpText("after", `
+Available keys:
+  weekly-weight   Weight for weekly waste risk; monthly = 1 − this (default: ${DEFAULT_SETTINGS.weeklyWeight})
+  min-5h          5h remaining % below which a profile is unusable (default: ${DEFAULT_SETTINGS.min5hPct})
+
+Examples:
+  droidx config                    Show current settings
+  droidx config weekly-weight 0.8  Set weekly weight (monthly becomes 0.2)
+  droidx config min-5h 20         Set 5h threshold to 20%
+  droidx config reset              Reset all settings to defaults`)
+  .action(async (key?: string, value?: string) => {
+    const config = await loadConfig();
+    if (!config.settings) config.settings = {};
+    applySettings(config);
+
+    // No args → show current settings.
+    if (!key) {
+      const ww = WEEKLY_WASTE_WEIGHT;
+      console.log();
+      console.log(`  weekly-weight  ${ww}  (monthly-weight = ${(1 - ww).toFixed(2)})`);
+      console.log(`  min-5h         ${MIN_5H_REMAINING_PCT}`);
+      console.log();
+      return;
+    }
+
+    // Reset.
+    if (key === "reset") {
+      delete config.settings;
+      await saveConfig(config);
+      console.log("Settings reset to defaults.");
+      return;
+    }
+
+    // Set a value.
+    const meta = SETTING_KEYS[key];
+    if (!meta) {
+      fail(`Unknown setting "${key}". Available: ${Object.keys(SETTING_KEYS).join(", ")}`);
+    }
+
+    if (value === undefined) {
+      // Show single key.
+      const resolved = { weeklyWeight: WEEKLY_WASTE_WEIGHT, min5hPct: MIN_5H_REMAINING_PCT };
+      console.log(`${key} = ${resolved[meta.field]}`);
+      return;
+    }
+
+    const num = Number(value);
+    if (Number.isNaN(num)) fail(`"${value}" is not a valid number.`);
+    const err = meta.validate(num);
+    if (err) fail(err);
+
+    config.settings[meta.field] = num;
+    await saveConfig(config);
+    applySettings(config);
+
+    if (meta.field === "weeklyWeight") {
+      console.log(`weekly-weight = ${num}  (monthly-weight = ${(1 - num).toFixed(2)})`);
+    } else {
+      console.log(`${key} = ${num}`);
+    }
+  });
 
 if (process.argv.length <= 2) {
   program.help();
