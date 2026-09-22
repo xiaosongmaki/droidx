@@ -17,6 +17,23 @@ npm install -g droidx
 
 ## Usage
 
+### Run Droid (auto-select best profile)
+
+Just run `droidx` — it automatically picks the profile with the most remaining quota:
+
+```bash
+droidx
+droidx -- droid exec "review this code"
+droidx --dry-run   # show which profile would be picked
+```
+
+### Run Droid with a specific profile
+
+```bash
+droidx run personal
+droidx run work -- droid exec "review this code"
+```
+
 ### Add a profile
 
 The API key is entered interactively and never echoed:
@@ -32,11 +49,10 @@ droidx add work
 droidx list        # or: droidx ls
 ```
 
-### Run Droid with a profile
+### Check quota status
 
 ```bash
-droidx run personal
-droidx run work -- droid exec "review this code"
+droidx status
 ```
 
 ### Remove a profile

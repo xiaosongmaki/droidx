@@ -1,7 +1,7 @@
 {
   "name": "droidx",
   "version": "0.1.0",
-  "description": "Switch Factory Droid API-key profiles securely on macOS.",
+  "description": "Run Factory Droid with the best available API-key profile. Auto-selects by remaining quota.",
   "type": "module",
   "license": "MIT",
   "author": "xiaosongmaki",

@@ -660,12 +660,22 @@ const program = new Command();
 
 program
   .name("droidx")
-  .description("Run Factory Droid with a selected API-key profile.")
+  .description(
+    "Run Factory Droid with the best available API-key profile.\n\n" +
+    "When invoked without a subcommand, droidx automatically picks the\n" +
+    "profile with the most remaining quota and launches droid.",
+  )
   .version("0.1.0")
+  .argument("[commandArgs...]", "Arguments forwarded to droid (default mode)")
+  .option("--dry-run", "Show which profile would be selected without launching droid")
+  .allowExcessArguments()
   .hook("preAction", async () => {
     const config = await loadConfig();
     applySettings(config);
-  });
+  })
+  .action((commandArgs: string[] = [], options: { dryRun?: boolean }) =>
+    autoRun(commandArgs, options),
+  );
 
 program
   .command("add <name>")
@@ -700,7 +710,7 @@ program
 program
   .command("auto [commandArgs...]")
   .description(
-    "Automatically pick the best profile based on remaining quota, then run droid",
+    "Alias for default behavior: pick the best profile and run droid",
   )
   .option("--dry-run", "Show which profile would be selected without launching droid")
   .allowExcessArguments()
@@ -790,8 +800,4 @@ Examples:
     }
   });
 
-if (process.argv.length <= 2) {
-  program.help();
-} else {
-  await program.parseAsync(process.argv);
-}
+await program.parseAsync(process.argv);
