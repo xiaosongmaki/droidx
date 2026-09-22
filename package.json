@@ -1,9 +1,35 @@
 {
   "name": "droidx",
   "version": "0.1.0",
-  "private": true,
   "description": "Switch Factory Droid API-key profiles securely on macOS.",
   "type": "module",
+  "license": "MIT",
+  "author": "xiaosongmaki",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaosongmaki/droidx.git"
+  },
+  "homepage": "https://github.com/xiaosongmaki/droidx#readme",
+  "bugs": {
+    "url": "https://github.com/xiaosongmaki/droidx/issues"
+  },
+  "keywords": [
+    "factory",
+    "droid",
+    "api-key",
+    "profile",
+    "keychain",
+    "macos",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "bin": {
     "droidx": "dist/cli.js"
   },
@@ -11,7 +37,8 @@
     "build": "tsc",
     "check": "tsc --noEmit",
     "dev": "tsx src/cli.ts",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "commander": "^14.0.0",
